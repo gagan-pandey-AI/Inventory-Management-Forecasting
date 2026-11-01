@@ -1,4 +1,4 @@
-from datetime import date
+from hashlib import sha256
 from pathlib import Path
 
 import mysql.connector
@@ -10,6 +10,8 @@ from inventory_intelligence import (
     build_inventory_analysis,
     calculate_inventory_turnover,
     get_reorder_recommendations,
+    read_inventory_turnover_csv,
+    validate_inventory_turnover_data,
 )
 
 # ---------------- PAGE CONFIG ----------------
@@ -1301,11 +1303,6 @@ elif page == "Inventory Turnover":
         step=30,
         key="turnover_period_days",
     )
-    turnover_as_of = st.date_input(
-        "Period end date",
-        value=date.today(),
-        key="turnover_as_of_date",
-    )
 
     if snapshot_upload is None or sales_upload is None:
         st.warning(
@@ -1314,110 +1311,183 @@ elif page == "Inventory Turnover":
         )
     else:
         try:
-            snapshot_data = pd.read_csv(snapshot_upload)
-            costed_sales = pd.read_csv(sales_upload)
-            turnover, turnover_explanation = calculate_inventory_turnover(
-                snapshot_data,
-                costed_sales,
-                period_days=turnover_period_days,
-                as_of_date=turnover_as_of,
-            )
+            snapshot_data = read_inventory_turnover_csv(snapshot_upload)
         except (
             pd.errors.EmptyDataError,
             pd.errors.ParserError,
             UnicodeDecodeError,
             OSError,
-        ):
-            st.error("Unable to read one of the uploaded turnover CSV files.")
+            ValueError,
+        ) as error:
+            st.error(f"Unable to read the inventory snapshots CSV: {error}")
         else:
-            st.caption(turnover_explanation)
-            if turnover.empty:
-                st.warning(
-                    "No product-level turnover can be calculated from the "
-                    "provided files. Check the required columns and dates."
-                )
+            try:
+                costed_sales = read_inventory_turnover_csv(sales_upload)
+            except (
+                pd.errors.EmptyDataError,
+                pd.errors.ParserError,
+                UnicodeDecodeError,
+                OSError,
+                ValueError,
+            ) as error:
+                st.error(f"Unable to read the costed sales CSV: {error}")
             else:
-                eligible_turnover = turnover.dropna(
-                    subset=["turnover_ratio", "average_inventory_value"]
+                validation_errors = validate_inventory_turnover_data(
+                    snapshot_data,
+                    costed_sales,
                 )
-                if eligible_turnover.empty:
-                    st.warning(
-                        "The files do not contain enough valid costed sales "
-                        "and dated inventory snapshots for a turnover ratio."
-                    )
+                if validation_errors:
+                    for validation_error in validation_errors:
+                        st.error(validation_error)
                 else:
-                    total_cogs = eligible_turnover["cogs"].sum()
-                    total_average_inventory = eligible_turnover[
-                        "average_inventory_value"
-                    ].sum()
-                    portfolio_turnover = (
-                        total_cogs / total_average_inventory
-                        if total_average_inventory > 0
-                        else 0
-                    )
-                    portfolio_dio = (
-                        turnover_period_days / portfolio_turnover
-                        if portfolio_turnover > 0
-                        else float("nan")
+                    st.success(
+                        "Both CSV files are valid. Turnover analysis is "
+                        "calculated from the uploaded costed data."
                     )
 
-                    st.markdown("### PORTFOLIO PERFORMANCE")
-                    turnover_kpis = st.columns(4)
-                    turnover_kpis[0].metric(
-                        "COGS",
-                        f"₹{total_cogs:,.2f}",
-                    )
-                    turnover_kpis[1].metric(
-                        "Average Inventory Value",
-                        f"₹{total_average_inventory:,.2f}",
-                    )
-                    turnover_kpis[2].metric(
-                        "Inventory Turnover",
-                        f"{portfolio_turnover:.2f}×",
-                    )
-                    turnover_kpis[3].metric(
-                        "Days Inventory Outstanding",
-                        f"{portfolio_dio:.1f}"
-                        if pd.notna(portfolio_dio)
-                        else "N/A",
-                    )
+                    latest_snapshot_date = pd.to_datetime(
+                        snapshot_data["snapshot_date"],
+                        errors="coerce",
+                    ).max().date()
+                    upload_signature = sha256(
+                        snapshot_upload.getvalue()
+                        + b"\0"
+                        + sales_upload.getvalue()
+                    ).hexdigest()
+                    if st.session_state.get(
+                        "turnover_upload_signature"
+                    ) != upload_signature:
+                        st.session_state["turnover_upload_signature"] = (
+                            upload_signature
+                        )
+                        st.session_state["turnover_as_of_date"] = (
+                            latest_snapshot_date
+                        )
 
-                    st.markdown("### PRODUCT-WISE TURNOVER")
-                    fig_turnover = px.bar(
-                        eligible_turnover.sort_values(
-                            "annualized_turnover",
-                            ascending=True,
-                        ),
-                        x="annualized_turnover",
-                        y="product_name",
-                        color="movement_classification",
-                        orientation="h",
-                        title="Annualized Turnover by Product",
-                        labels={
-                            "annualized_turnover": "Turns per year",
-                            "product_name": "Product",
-                        },
+                    turnover_as_of = st.date_input(
+                        "Period end date",
+                        value=latest_snapshot_date,
+                        key="turnover_as_of_date",
                     )
-                    fig_turnover.update_layout(
-                        paper_bgcolor="rgba(0,0,0,0)",
-                        plot_bgcolor="rgba(0,0,0,0)",
-                        font_color="#CBD5E1",
+                    turnover, turnover_explanation = (
+                        calculate_inventory_turnover(
+                            snapshot_data,
+                            costed_sales,
+                            period_days=turnover_period_days,
+                            as_of_date=turnover_as_of,
+                        )
                     )
-                    st.plotly_chart(
-                        fig_turnover,
-                        use_container_width=True,
-                    )
-                st.dataframe(
-                    turnover,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-                st.download_button(
-                    "Download Inventory Turnover CSV",
-                    data=turnover.to_csv(index=False).encode("utf-8"),
-                    file_name="inventory_turnover_analysis.csv",
-                    mime="text/csv",
-                )
+                    st.caption(turnover_explanation)
+                    if turnover.empty:
+                        st.warning(
+                            "No product-level turnover can be calculated from "
+                            "the provided files. Check the selected period and "
+                            "ensure each product has at least two dated "
+                            "snapshots."
+                        )
+                    else:
+                        eligible_turnover = turnover.dropna(
+                            subset=[
+                                "turnover_ratio",
+                                "average_inventory_value",
+                            ]
+                        )
+                        if eligible_turnover.empty:
+                            st.warning(
+                                "The files do not contain enough valid costed "
+                                "sales and dated inventory snapshots for a "
+                                "turnover ratio."
+                            )
+                        else:
+                            total_cogs = eligible_turnover["cogs"].sum()
+                            total_average_inventory = eligible_turnover[
+                                "average_inventory_value"
+                            ].sum()
+                            portfolio_turnover = (
+                                total_cogs / total_average_inventory
+                                if total_average_inventory > 0
+                                else 0
+                            )
+                            portfolio_dio = (
+                                turnover_period_days / portfolio_turnover
+                                if portfolio_turnover > 0
+                                else float("nan")
+                            )
+
+                            st.markdown("### PORTFOLIO PERFORMANCE")
+                            turnover_kpis = st.columns(4)
+                            turnover_kpis[0].metric(
+                                "COGS",
+                                f"₹{total_cogs:,.2f}",
+                            )
+                            turnover_kpis[1].metric(
+                                "Average Inventory Value",
+                                f"₹{total_average_inventory:,.2f}",
+                            )
+                            turnover_kpis[2].metric(
+                                "Inventory Turnover",
+                                f"{portfolio_turnover:.2f}×",
+                            )
+                            turnover_kpis[3].metric(
+                                "Days Inventory Outstanding",
+                                f"{portfolio_dio:.1f}"
+                                if pd.notna(portfolio_dio)
+                                else "N/A",
+                            )
+
+                            st.markdown("### PRODUCT-WISE TURNOVER")
+                            plot_data = eligible_turnover.copy()
+                            plot_data["product_label"] = plot_data[
+                                "product_name"
+                            ].fillna(plot_data["product_id"].astype(str))
+                            missing_product_names = (
+                                plot_data["product_label"]
+                                .astype(str)
+                                .str.strip()
+                                .eq("")
+                            )
+                            plot_data.loc[
+                                missing_product_names,
+                                "product_label",
+                            ] = plot_data.loc[
+                                missing_product_names,
+                                "product_id",
+                            ].astype(str)
+                            fig_turnover = px.bar(
+                                plot_data.sort_values(
+                                    "annualized_turnover",
+                                    ascending=True,
+                                ),
+                                x="annualized_turnover",
+                                y="product_label",
+                                color="movement_classification",
+                                orientation="h",
+                                title="Annualized Turnover by Product",
+                                labels={
+                                    "annualized_turnover": "Turns per year",
+                                    "product_label": "Product",
+                                },
+                            )
+                            fig_turnover.update_layout(
+                                paper_bgcolor="rgba(0,0,0,0)",
+                                plot_bgcolor="rgba(0,0,0,0)",
+                                font_color="#CBD5E1",
+                            )
+                            st.plotly_chart(
+                                fig_turnover,
+                                use_container_width=True,
+                            )
+                        st.dataframe(
+                            turnover,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                        st.download_button(
+                            "Download Inventory Turnover CSV",
+                            data=turnover.to_csv(index=False).encode("utf-8"),
+                            file_name="inventory_turnover_analysis.csv",
+                            mime="text/csv",
+                        )
 
 
 elif page == "Overstock Intelligence":
@@ -2298,5 +2368,3 @@ st.caption(
     "Note: Historical sales in this demonstration use simulated data. "
     "Forecasts are model estimates, not guaranteed future demand."
 )
-
-

@@ -1,3 +1,4 @@
+from io import StringIO
 import unittest
 
 import pandas as pd
@@ -6,6 +7,8 @@ from dashboard.inventory_intelligence import (
     build_inventory_analysis,
     calculate_inventory_turnover,
     get_reorder_recommendations,
+    read_inventory_turnover_csv,
+    validate_inventory_turnover_data,
 )
 
 
@@ -276,6 +279,7 @@ class InventoryTurnoverTests(unittest.TestCase):
         self.assertAlmostEqual(row["cogs"], 100)
         self.assertAlmostEqual(row["turnover_ratio"], 0.1)
         self.assertAlmostEqual(row["days_inventory_outstanding"], 300)
+        self.assertIn("Fast-moving", row["movement_classification"])
         self.assertIn("time-weighted", explanation)
 
     def test_missing_snapshots_or_costs_are_reported_not_fabricated(self):
@@ -352,6 +356,125 @@ class InventoryTurnoverTests(unittest.TestCase):
         self.assertEqual(result.loc[0, "turnover_ratio"], 0)
         self.assertTrue(pd.isna(result.loc[0, "days_inventory_outstanding"]))
         self.assertIn("Slow-moving", result.loc[0, "movement_classification"])
+
+    def test_exact_duplicate_records_are_not_double_counted(self):
+        snapshots = pd.concat(
+            [self.snapshots, self.snapshots.iloc[[0]]],
+            ignore_index=True,
+        )
+        sales = pd.concat(
+            [self.sales, self.sales],
+            ignore_index=True,
+        )
+
+        result, explanation = calculate_inventory_turnover(
+            snapshots,
+            sales,
+            period_days=30,
+            as_of_date="2026-03-02",
+        )
+
+        self.assertEqual(result.loc[0, "cogs"], 100)
+        self.assertEqual(result.loc[0, "average_inventory_value"], 1000)
+        self.assertIn("Ignored 1 exact duplicate snapshot row(s)", explanation)
+        self.assertIn("1 exact duplicate sales row(s)", explanation)
+
+
+class InventoryTurnoverUploadTests(unittest.TestCase):
+    def setUp(self):
+        self.snapshots_csv = StringIO(
+            "product_id,product_name,snapshot_date,stock_quantity,unit_cost\n"
+            "001,Test product,2026-02-01,100,10\n"
+            "001,Test product,2026-03-02,100,10\n"
+        )
+        self.sales_csv = StringIO(
+            "product_id,sale_date,quantity_sold,unit_cost\n"
+            "001,2026-02-20,10,10\n"
+        )
+
+    def test_successful_csv_uploads_are_parsed_and_validated(self):
+        snapshots = read_inventory_turnover_csv(self.snapshots_csv)
+        sales = read_inventory_turnover_csv(self.sales_csv)
+
+        self.assertEqual(snapshots.loc[0, "product_id"], "001")
+        self.assertEqual(validate_inventory_turnover_data(snapshots, sales), [])
+        self.assertEqual(
+            validate_inventory_turnover_data(
+                snapshots.drop(columns="product_name"),
+                sales,
+            ),
+            [],
+        )
+
+    def test_invalid_and_empty_csv_files_are_reported(self):
+        with self.assertRaises(pd.errors.ParserError):
+            read_inventory_turnover_csv(StringIO('"unterminated'))
+
+        with self.assertRaises(pd.errors.EmptyDataError):
+            read_inventory_turnover_csv(StringIO(""))
+
+        snapshots = read_inventory_turnover_csv(self.snapshots_csv)
+        errors = validate_inventory_turnover_data(
+            snapshots,
+            pd.DataFrame(
+                columns=[
+                    "product_id",
+                    "sale_date",
+                    "quantity_sold",
+                    "unit_cost",
+                ]
+            ),
+        )
+        self.assertIn("Costed sales CSV is empty.", errors)
+
+    def test_missing_columns_and_invalid_values_are_reported(self):
+        snapshots = pd.DataFrame(
+            {
+                "product_id": ["1"],
+                "snapshot_date": ["not-a-date"],
+                "stock_quantity": ["not-a-number"],
+            }
+        )
+        sales = pd.DataFrame(
+            {
+                "product_id": ["1"],
+                "sale_date": ["2026-02-20"],
+                "quantity_sold": [10],
+                "unit_cost": [10],
+            }
+        )
+
+        errors = validate_inventory_turnover_data(snapshots, sales)
+
+        self.assertTrue(any("missing required columns: unit_cost" in e for e in errors))
+        self.assertTrue(any("invalid dates in 'snapshot_date'" in e for e in errors))
+        self.assertTrue(any("non-numeric values in 'stock_quantity'" in e for e in errors))
+
+    def test_missing_values_and_negative_costs_are_reported(self):
+        snapshots = pd.DataFrame(
+            {
+                "product_id": ["1"],
+                "snapshot_date": ["2026-02-01"],
+                "stock_quantity": [100],
+                "unit_cost": [10],
+            }
+        )
+        sales = pd.DataFrame(
+            {
+                "product_id": ["1"],
+                "sale_date": ["2026-02-20"],
+                "quantity_sold": [10],
+                "unit_cost": [None],
+            }
+        )
+
+        errors = validate_inventory_turnover_data(snapshots, sales)
+
+        self.assertTrue(any("missing values in 'unit_cost'" in e for e in errors))
+
+        sales.loc[0, "unit_cost"] = -10
+        errors = validate_inventory_turnover_data(snapshots, sales)
+        self.assertTrue(any("negative values in 'unit_cost'" in e for e in errors))
 
 
 if __name__ == "__main__":

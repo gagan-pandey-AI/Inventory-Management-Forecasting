@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 from datetime import date
+from pathlib import Path
+from typing import IO
 
 import numpy as np
 import pandas as pd
@@ -23,6 +25,19 @@ TURNOVER_COLUMNS = [
     "snapshot_count",
 ]
 
+TURNOVER_SNAPSHOT_REQUIRED_COLUMNS = {
+    "product_id",
+    "snapshot_date",
+    "stock_quantity",
+    "unit_cost",
+}
+TURNOVER_SALES_REQUIRED_COLUMNS = {
+    "product_id",
+    "sale_date",
+    "quantity_sold",
+    "unit_cost",
+}
+
 
 def _as_date(value: date | str | pd.Timestamp | None) -> pd.Timestamp:
     if value is None:
@@ -33,6 +48,101 @@ def _as_date(value: date | str | pd.Timestamp | None) -> pd.Timestamp:
 def _number(value: object) -> float:
     parsed = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     return float(parsed) if pd.notna(parsed) else math.nan
+
+
+def read_inventory_turnover_csv(
+    source: IO[bytes] | IO[str] | str | Path,
+) -> pd.DataFrame:
+    """Read an uploaded turnover CSV while preserving product identifiers."""
+    return pd.read_csv(source, dtype={"product_id": "string"})
+
+
+def validate_inventory_turnover_data(
+    snapshots: pd.DataFrame,
+    sales: pd.DataFrame,
+) -> list[str]:
+    """Return user-readable issues found in the uploaded turnover data."""
+    errors: list[str] = []
+    sources = (
+        (
+            "Inventory snapshots",
+            snapshots,
+            TURNOVER_SNAPSHOT_REQUIRED_COLUMNS,
+            "snapshot_date",
+            ("stock_quantity", "unit_cost"),
+        ),
+        (
+            "Costed sales",
+            sales,
+            TURNOVER_SALES_REQUIRED_COLUMNS,
+            "sale_date",
+            ("quantity_sold", "unit_cost"),
+        ),
+    )
+    for label, frame, required, date_column, numeric_columns in sources:
+        if frame.empty:
+            errors.append(f"{label} CSV is empty.")
+            continue
+
+        missing_columns = required.difference(frame.columns)
+        if missing_columns:
+            errors.append(
+                f"{label} CSV is missing required columns: "
+                + ", ".join(sorted(missing_columns))
+                + "."
+            )
+
+        for column in required.intersection(frame.columns):
+            values = frame[column]
+            missing_values = values.isna()
+            if column == "product_id":
+                missing_values |= values.astype("string").str.strip().eq("")
+            if missing_values.any():
+                errors.append(
+                    f"{label} CSV has missing values in '{column}' "
+                    f"({int(missing_values.sum())} row(s))."
+                )
+
+        if date_column in frame.columns:
+            parsed_dates = pd.to_datetime(
+                frame[date_column],
+                errors="coerce",
+            )
+            invalid_dates = parsed_dates.isna()
+            if invalid_dates.any() and not invalid_dates.equals(
+                frame[date_column].isna()
+            ):
+                errors.append(
+                    f"{label} CSV has invalid dates in '{date_column}' "
+                    f"({int((invalid_dates & frame[date_column].notna()).sum())} "
+                    "row(s))."
+                )
+
+        for column in numeric_columns:
+            if column not in frame.columns:
+                continue
+            values = frame[column]
+            parsed_values = pd.to_numeric(values, errors="coerce")
+            invalid_values = parsed_values.isna() & values.notna()
+            if invalid_values.any():
+                errors.append(
+                    f"{label} CSV has non-numeric values in '{column}' "
+                    f"({int(invalid_values.sum())} row(s))."
+                )
+            non_finite_values = parsed_values.notna() & ~np.isfinite(
+                parsed_values
+            )
+            if non_finite_values.any():
+                errors.append(
+                    f"{label} CSV has non-finite values in '{column}'."
+                )
+            negative_values = parsed_values.lt(0)
+            if negative_values.any():
+                errors.append(
+                    f"{label} CSV has negative values in '{column}' "
+                    f"({int(negative_values.sum())} row(s))."
+                )
+    return errors
 
 
 def build_inventory_analysis(
@@ -411,20 +521,10 @@ def calculate_inventory_turnover(
             "Costed sales transactions are required to calculate COGS.",
         )
 
-    snapshot_required = {
-        "product_id",
-        "snapshot_date",
-        "stock_quantity",
-        "unit_cost",
-    }
-    sales_required = {
-        "product_id",
-        "sale_date",
-        "quantity_sold",
-        "unit_cost",
-    }
-    missing_snapshot = snapshot_required.difference(snapshots.columns)
-    missing_sales = sales_required.difference(sales.columns)
+    missing_snapshot = TURNOVER_SNAPSHOT_REQUIRED_COLUMNS.difference(
+        snapshots.columns
+    )
+    missing_sales = TURNOVER_SALES_REQUIRED_COLUMNS.difference(sales.columns)
     if missing_snapshot:
         return (
             pd.DataFrame(columns=TURNOVER_COLUMNS),
@@ -440,8 +540,10 @@ def calculate_inventory_turnover(
             + ". unit_price is selling price and is not a substitute for unit_cost.",
         )
 
-    snapshot_data = snapshots.copy()
-    sales_data = sales.copy()
+    duplicate_snapshot_count = int(snapshots.duplicated().sum())
+    duplicate_sales_count = int(sales.duplicated().sum())
+    snapshot_data = snapshots.drop_duplicates().copy()
+    sales_data = sales.drop_duplicates().copy()
     snapshot_data["snapshot_date"] = pd.to_datetime(
         snapshot_data["snapshot_date"],
         errors="coerce",
@@ -660,6 +762,13 @@ def calculate_inventory_turnover(
             "of dated stock_quantity × snapshot unit_cost. Turnover is COGS "
             "÷ average inventory value; DIO is period days ÷ turnover. "
             "Fast/slow labels are relative to the eligible portfolio median."
+            + (
+                f" Ignored {duplicate_snapshot_count} exact duplicate "
+                "snapshot row(s) and "
+                f"{duplicate_sales_count} exact duplicate sales row(s)."
+                if duplicate_snapshot_count or duplicate_sales_count
+                else ""
+            )
         ),
     )
 
