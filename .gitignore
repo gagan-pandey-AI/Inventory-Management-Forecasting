@@ -28,3 +28,4 @@ service-account*.json
 .ruff_cache/
 .coverage
 htmlcov/
+import mysql.connector.txt
