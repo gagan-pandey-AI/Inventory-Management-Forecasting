@@ -1,8 +1,16 @@
-import streamlit as st
+from datetime import date
+from pathlib import Path
+
+import mysql.connector
 import pandas as pd
 import plotly.express as px
-import mysql.connector
-from pathlib import Path
+import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
+from inventory_intelligence import (
+    build_inventory_analysis,
+    calculate_inventory_turnover,
+    get_reorder_recommendations,
+)
 
 # ---------------- PAGE CONFIG ----------------
 
@@ -21,6 +29,366 @@ def connect_to_database(**config):
     return mysql.connector.connect(**config, connect_timeout=5)
 
 
+def get_mysql_table_columns(cursor, table_name):
+    cursor.execute(
+        """
+        SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s
+        """,
+        (table_name,)
+    )
+    return {row[0] for row in cursor.fetchall()}
+
+
+def load_inventory_intelligence_from_mysql(config):
+    connection = connect_to_database(**config)
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        inventory_columns = get_mysql_table_columns(cursor, "inventory")
+        product_columns = get_mysql_table_columns(cursor, "products")
+        sales_columns = get_mysql_table_columns(cursor, "sales")
+        supplier_columns = get_mysql_table_columns(cursor, "suppliers")
+        purchase_columns = get_mysql_table_columns(cursor, "purchase_orders")
+        purchase_item_columns = get_mysql_table_columns(
+            cursor,
+            "purchase_order_items"
+        )
+
+        required_inventory_columns = {
+            "product_id",
+            "stock_quantity",
+            "reorder_level",
+            "lead_time_days",
+        }
+        if not required_inventory_columns.issubset(inventory_columns):
+            raise ValueError("The inventory table is missing required columns.")
+        if not {"product_id", "product_name"}.issubset(product_columns):
+            raise ValueError("The products table is missing required columns.")
+
+        supplier_join = ""
+        supplier_select = ""
+        if (
+            "supplier_id" in product_columns
+            and {"supplier_id", "supplier_name"}.issubset(supplier_columns)
+        ):
+            supplier_join = (
+                " LEFT JOIN suppliers s ON p.supplier_id = s.supplier_id"
+            )
+            supplier_select = ", s.supplier_name"
+
+        inventory_query = f"""
+            SELECT
+                p.product_id,
+                p.product_name,
+                i.stock_quantity,
+                i.reorder_level,
+                i.lead_time_days,
+                i.last_updated
+                {supplier_select}
+            FROM inventory i
+            JOIN products p ON i.product_id = p.product_id
+            {supplier_join}
+            ORDER BY p.product_id
+        """
+        cursor.execute(inventory_query)
+        inventory = pd.DataFrame(
+            cursor.fetchall(),
+            columns=[column[0] for column in cursor.description],
+        )
+        if "supplier_name" in inventory.columns:
+            inventory["supplier_mapping_source"] = "Product master"
+
+        sales_select = "sale_date, product_id, quantity_sold"
+        if "unit_cost" in sales_columns:
+            sales_select += ", unit_cost"
+        cursor.execute(
+            f"""
+            SELECT {sales_select}
+            FROM sales
+            WHERE sale_date >= DATE_SUB(CURRENT_DATE, INTERVAL 90 DAY)
+              AND sale_date <= CURRENT_DATE
+            ORDER BY sale_date
+            """
+        )
+        sales = pd.DataFrame(
+            cursor.fetchall(),
+            columns=[column[0] for column in cursor.description],
+        )
+
+        if (
+            "product_id" in purchase_item_columns
+            and "quantity_ordered" in purchase_item_columns
+            and "order_id" in purchase_item_columns
+            and {"order_id", "order_status"}.issubset(purchase_columns)
+        ):
+            cursor.execute(
+                """
+                SELECT
+                    poi.product_id,
+                    SUM(poi.quantity_ordered) AS pending_order_quantity
+                FROM purchase_order_items poi
+                JOIN purchase_orders po ON po.order_id = poi.order_id
+                WHERE po.order_status = 'Pending'
+                GROUP BY poi.product_id
+                """
+            )
+            pending = pd.DataFrame(
+                cursor.fetchall(),
+                columns=[column[0] for column in cursor.description],
+            )
+            inventory = inventory.merge(
+                pending,
+                on="product_id",
+                how="left",
+                validate="one_to_one",
+            )
+            inventory["pending_order_quantity"] = (
+                inventory["pending_order_quantity"].fillna(0)
+            )
+
+        if (
+            "supplier_name" not in inventory.columns
+            and "product_id" in purchase_item_columns
+            and "quantity_ordered" in purchase_item_columns
+            and "order_id" in purchase_item_columns
+            and {"order_id", "supplier_id"}.issubset(purchase_columns)
+            and {"supplier_id", "supplier_name"}.issubset(supplier_columns)
+        ):
+            cursor.execute(
+                """
+                SELECT
+                    poi.product_id,
+                    s.supplier_name,
+                    SUM(poi.quantity_ordered) AS ordered_units
+                FROM purchase_order_items poi
+                JOIN purchase_orders po ON po.order_id = poi.order_id
+                JOIN suppliers s ON s.supplier_id = po.supplier_id
+                GROUP BY poi.product_id, s.supplier_id, s.supplier_name
+                ORDER BY poi.product_id, ordered_units DESC, s.supplier_name
+                """
+            )
+            supplier_history = pd.DataFrame(
+                cursor.fetchall(),
+                columns=[column[0] for column in cursor.description],
+            )
+            supplier_history = supplier_history.drop_duplicates(
+                "product_id",
+                keep="first",
+            )[["product_id", "supplier_name"]]
+            inventory = inventory.merge(
+                supplier_history,
+                on="product_id",
+                how="left",
+                validate="one_to_one",
+            )
+            inventory["supplier_mapping_source"] = (
+                "Most ordered historical supplier"
+            )
+        if "supplier_name" not in inventory.columns:
+            inventory["supplier_name"] = pd.NA
+            inventory["supplier_mapping_source"] = "Supplier not mapped"
+
+        return inventory, sales
+    finally:
+        if cursor is not None:
+            cursor.close()
+        connection.close()
+
+
+def get_mysql_secret_config():
+    try:
+        has_mysql_secrets = "mysql" in st.secrets
+    except StreamlitSecretNotFoundError:
+        return None
+    if not has_mysql_secrets:
+        return None
+    configured = st.secrets["mysql"]
+    required = ("host", "user", "password")
+    missing = [key for key in required if not configured.get(key)]
+    if missing:
+        raise ValueError(
+            "The mysql Streamlit secret is missing required settings: "
+            + ", ".join(missing)
+        )
+    return {
+        "host": configured["host"],
+        "user": configured["user"],
+        "password": configured["password"],
+        "database": configured.get("database", "inventoryforecastdb"),
+        "port": int(configured.get("port", 3306)),
+    }
+
+
+def render_intelligence_data_source(section_key):
+    st.markdown("### Inventory data source")
+    st.caption(
+        "Connect to a reachable MySQL server or upload a current inventory "
+        "export. On Streamlit Community Cloud, localhost is the app container."
+    )
+    source = st.radio(
+        "Choose inventory source",
+        ["Upload inventory CSV", "Connect to MySQL"],
+        horizontal=True,
+        key=f"{section_key}_data_source",
+    )
+
+    if source == "Upload inventory CSV":
+        uploaded_inventory = st.file_uploader(
+            "Current inventory CSV",
+            type=["csv"],
+            help=(
+                "Required columns: product_id, product_name, stock_quantity, "
+                "reorder_level, lead_time_days. Optional: supplier_name and "
+                "pending_order_quantity."
+            ),
+            key=f"{section_key}_inventory_upload",
+        )
+        uploaded_sales = st.file_uploader(
+            "Optional recent sales CSV",
+            type=["csv"],
+            help=(
+                "For products without an available forecast, provide "
+                "product_id, sale_date, and quantity_sold."
+            ),
+            key=f"{section_key}_sales_upload",
+        )
+        if uploaded_inventory is None:
+            return None, None
+        try:
+            inventory = pd.read_csv(uploaded_inventory)
+            required = {
+                "product_id",
+                "product_name",
+                "stock_quantity",
+                "reorder_level",
+                "lead_time_days",
+            }
+            missing = required.difference(inventory.columns)
+            if missing:
+                st.error(
+                    "Inventory CSV is missing required columns: "
+                    + ", ".join(sorted(missing))
+                )
+                return None, None
+            sales = (
+                pd.read_csv(uploaded_sales)
+                if uploaded_sales is not None
+                else None
+            )
+            if sales is not None:
+                sales_required = {
+                    "product_id",
+                    "sale_date",
+                    "quantity_sold",
+                }
+                missing_sales = sales_required.difference(sales.columns)
+                if missing_sales:
+                    st.error(
+                        "Sales CSV is missing required columns: "
+                        + ", ".join(sorted(missing_sales))
+                    )
+                    return None, None
+            return inventory, sales
+        except (
+            pd.errors.EmptyDataError,
+            pd.errors.ParserError,
+            UnicodeDecodeError,
+            OSError,
+        ):
+            st.error("Unable to read the uploaded CSV file.")
+            return None, None
+
+    try:
+        secret_config = get_mysql_secret_config()
+    except ValueError as error:
+        st.error(str(error))
+        return None, None
+
+    if secret_config is not None:
+        if st.button(
+            "Load live inventory from configured MySQL",
+            key=f"{section_key}_secret_mysql_submit",
+        ):
+            try:
+                inventory, sales = load_inventory_intelligence_from_mysql(
+                    secret_config
+                )
+                st.session_state["intelligence_inventory"] = inventory
+                st.session_state["intelligence_sales"] = sales
+                st.success("Live inventory data loaded.")
+            except (mysql.connector.Error, ValueError):
+                st.session_state.pop("intelligence_inventory", None)
+                st.session_state.pop("intelligence_sales", None)
+                st.error(
+                    "Unable to load inventory intelligence data. Check the "
+                    "reachable database, credentials, and required schema. "
+                    "Connection details are not displayed."
+                )
+        return (
+            st.session_state.get("intelligence_inventory"),
+            st.session_state.get("intelligence_sales"),
+        )
+
+    st.caption(
+        "For Streamlit Community Cloud, you may instead configure a "
+        "[mysql] section in the app's Secrets settings. Never commit "
+        "database credentials."
+    )
+    st.code(
+        '[mysql]\nhost = "your-external-database-host"\n'
+        'user = "your-database-user"\npassword = "..."\n'
+        'database = "inventoryforecastdb"\nport = 3306',
+        language="toml",
+    )
+    with st.form(f"{section_key}_mysql_form"):
+        host = st.text_input("MySQL Host", key=f"{section_key}_mysql_host")
+        user = st.text_input("MySQL Username", key=f"{section_key}_mysql_user")
+        password = st.text_input(
+            "MySQL Password",
+            type="password",
+            key=f"{section_key}_mysql_password",
+        )
+        database = st.text_input(
+            "Database",
+            value="inventoryforecastdb",
+            key=f"{section_key}_mysql_database",
+        )
+        connect = st.form_submit_button("Load live inventory")
+
+    if connect:
+        if not all((host, user, password, database)):
+            st.warning("Enter the MySQL host, username, password, and database.")
+        else:
+            try:
+                inventory, sales = load_inventory_intelligence_from_mysql(
+                    {
+                        "host": host,
+                        "user": user,
+                        "password": password,
+                        "database": database,
+                        "port": 3306,
+                    }
+                )
+                st.session_state["intelligence_inventory"] = inventory
+                st.session_state["intelligence_sales"] = sales
+                st.success("Live inventory data loaded.")
+            except (mysql.connector.Error, ValueError):
+                st.session_state.pop("intelligence_inventory", None)
+                st.session_state.pop("intelligence_sales", None)
+                st.error(
+                    "Unable to load inventory intelligence data. Check the "
+                    "reachable database, credentials, and required schema. "
+                    "Connection details are not displayed."
+                )
+
+    return (
+        st.session_state.get("intelligence_inventory"),
+        st.session_state.get("intelligence_sales"),
+    )
+
+
 # ---------------- LOAD DATA ----------------
 
 @st.cache_data
@@ -29,6 +397,12 @@ def load_data():
     products = pd.read_csv(REPORTS_DIR / "product_sales_analysis.csv")
     forecast = pd.read_csv(REPORTS_DIR / "forecast_summary.csv")
     return monthly, products, forecast
+
+
+@st.cache_data
+def load_daily_forecast():
+    return pd.read_csv(REPORTS_DIR / "demand_forecast.csv")
+
 
 try:
     monthly, products, forecast = load_data()
@@ -164,6 +538,9 @@ with st.sidebar:
         "Inventory Monitoring",
         "Supplier Analytics",
         "Forecast Performance",
+        "Inventory Turnover",
+        "Overstock Intelligence",
+        "AI Reorder Recommendations",
         "Project Guide"
     ],
     label_visibility="visible"
@@ -886,6 +1263,454 @@ elif page == "Supplier Analytics":
 # FORECAST PERFORMANCE
 # ==========================================
 
+elif page == "Inventory Turnover":
+
+    st.markdown(
+        '<div class="section-title">INVENTORY TURNOVER ANALYSIS</div>',
+        unsafe_allow_html=True
+    )
+    st.info(
+        "A single current-stock row cannot establish average inventory. "
+        "Upload dated stock snapshots and costed sales transactions to "
+        "calculate actual cost-based turnover; sales unit_price is not COGS."
+    )
+
+    snapshot_upload = st.file_uploader(
+        "Inventory snapshots CSV",
+        type=["csv"],
+        help=(
+            "Required columns: product_id, snapshot_date, stock_quantity, "
+            "unit_cost. Include at least two dated snapshots per product."
+        ),
+        key="turnover_snapshots_upload",
+    )
+    sales_upload = st.file_uploader(
+        "Costed sales transactions CSV",
+        type=["csv"],
+        help=(
+            "Required columns: product_id, sale_date, quantity_sold, unit_cost. "
+            "unit_cost must be acquisition cost, not sales unit_price."
+        ),
+        key="turnover_sales_upload",
+    )
+    turnover_period_days = st.slider(
+        "Analysis period (days)",
+        min_value=30,
+        max_value=365,
+        value=90,
+        step=30,
+        key="turnover_period_days",
+    )
+    turnover_as_of = st.date_input(
+        "Period end date",
+        value=date.today(),
+        key="turnover_as_of_date",
+    )
+
+    if snapshot_upload is None or sales_upload is None:
+        st.warning(
+            "Turnover results are unavailable until both source CSVs are "
+            "provided. No stock history or acquisition cost is inferred."
+        )
+    else:
+        try:
+            snapshot_data = pd.read_csv(snapshot_upload)
+            costed_sales = pd.read_csv(sales_upload)
+            turnover, turnover_explanation = calculate_inventory_turnover(
+                snapshot_data,
+                costed_sales,
+                period_days=turnover_period_days,
+                as_of_date=turnover_as_of,
+            )
+        except (
+            pd.errors.EmptyDataError,
+            pd.errors.ParserError,
+            UnicodeDecodeError,
+            OSError,
+        ):
+            st.error("Unable to read one of the uploaded turnover CSV files.")
+        else:
+            st.caption(turnover_explanation)
+            if turnover.empty:
+                st.warning(
+                    "No product-level turnover can be calculated from the "
+                    "provided files. Check the required columns and dates."
+                )
+            else:
+                eligible_turnover = turnover.dropna(
+                    subset=["turnover_ratio", "average_inventory_value"]
+                )
+                if eligible_turnover.empty:
+                    st.warning(
+                        "The files do not contain enough valid costed sales "
+                        "and dated inventory snapshots for a turnover ratio."
+                    )
+                else:
+                    total_cogs = eligible_turnover["cogs"].sum()
+                    total_average_inventory = eligible_turnover[
+                        "average_inventory_value"
+                    ].sum()
+                    portfolio_turnover = (
+                        total_cogs / total_average_inventory
+                        if total_average_inventory > 0
+                        else 0
+                    )
+                    portfolio_dio = (
+                        turnover_period_days / portfolio_turnover
+                        if portfolio_turnover > 0
+                        else float("nan")
+                    )
+
+                    st.markdown("### PORTFOLIO PERFORMANCE")
+                    turnover_kpis = st.columns(4)
+                    turnover_kpis[0].metric(
+                        "COGS",
+                        f"₹{total_cogs:,.2f}",
+                    )
+                    turnover_kpis[1].metric(
+                        "Average Inventory Value",
+                        f"₹{total_average_inventory:,.2f}",
+                    )
+                    turnover_kpis[2].metric(
+                        "Inventory Turnover",
+                        f"{portfolio_turnover:.2f}×",
+                    )
+                    turnover_kpis[3].metric(
+                        "Days Inventory Outstanding",
+                        f"{portfolio_dio:.1f}"
+                        if pd.notna(portfolio_dio)
+                        else "N/A",
+                    )
+
+                    st.markdown("### PRODUCT-WISE TURNOVER")
+                    fig_turnover = px.bar(
+                        eligible_turnover.sort_values(
+                            "annualized_turnover",
+                            ascending=True,
+                        ),
+                        x="annualized_turnover",
+                        y="product_name",
+                        color="movement_classification",
+                        orientation="h",
+                        title="Annualized Turnover by Product",
+                        labels={
+                            "annualized_turnover": "Turns per year",
+                            "product_name": "Product",
+                        },
+                    )
+                    fig_turnover.update_layout(
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        font_color="#CBD5E1",
+                    )
+                    st.plotly_chart(
+                        fig_turnover,
+                        use_container_width=True,
+                    )
+                st.dataframe(
+                    turnover,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.download_button(
+                    "Download Inventory Turnover CSV",
+                    data=turnover.to_csv(index=False).encode("utf-8"),
+                    file_name="inventory_turnover_analysis.csv",
+                    mime="text/csv",
+                )
+
+
+elif page == "Overstock Intelligence":
+
+    st.markdown(
+        '<div class="section-title">OVERSTOCK INTELLIGENCE</div>',
+        unsafe_allow_html=True
+    )
+    inventory_data, historical_sales = render_intelligence_data_source(
+        "overstock"
+    )
+    safety_buffer_days = st.slider(
+        "Low-stock safety buffer (days)",
+        min_value=0,
+        max_value=30,
+        value=7,
+        help="Used after supplier lead time to identify low-stock coverage.",
+        key="overstock_safety_buffer",
+    )
+    overstock_target_days = st.slider(
+        "Overstock target coverage (days)",
+        min_value=15,
+        max_value=180,
+        value=60,
+        help=(
+            "Stock above forecast demand for this many days is classified "
+            "as overstock. This is a configurable planning policy."
+        ),
+        key="overstock_target",
+    )
+    if inventory_data is None:
+        st.info("Provide current inventory data to calculate stock coverage.")
+    else:
+        try:
+            daily_forecast = load_daily_forecast()
+        except FileNotFoundError:
+            daily_forecast = pd.DataFrame()
+            st.warning(
+                "The daily demand forecast report is missing. Historical "
+                "sales will be used only where supplied."
+            )
+        analysis = build_inventory_analysis(
+            inventory_data,
+            daily_forecast,
+            historical_sales,
+            safety_buffer_days=safety_buffer_days,
+            overstock_target_days=overstock_target_days,
+        )
+
+        st.markdown("### STOCK HEALTH")
+        category_counts = analysis["classification"].value_counts()
+        overstocked = analysis.loc[
+            analysis["classification"].eq("Overstock")
+        ]
+        known_excess = overstocked["excess_quantity"].dropna()
+        kpis = st.columns(4)
+        kpis[0].metric("Products Analyzed", len(analysis))
+        kpis[1].metric(
+            "Critical / Low",
+            int(
+                category_counts.get("Critical Low Stock", 0)
+                + category_counts.get("Low Stock", 0)
+            ),
+        )
+        kpis[2].metric(
+            "Overstocked Products",
+            int(category_counts.get("Overstock", 0)),
+        )
+        kpis[3].metric(
+            "Known Excess Units",
+            f"{known_excess.sum():,.0f}" if not known_excess.empty else "N/A",
+        )
+
+        st.caption(
+            "Critical: at/below reorder level or forecast to run out by "
+            "supplier lead time. Low: coverage within lead time plus the "
+            f"{safety_buffer_days}-day buffer. Overstock: coverage exceeds "
+            f"the configurable {overstock_target_days}-day target. Zero "
+            "forecast demand makes days of cover undefined; positive stock "
+            "is shown as excess against zero forecast demand. Demand uses "
+            "the mean of available future daily forecasts; where no forecast "
+            "exists, it falls back to the supplied 90-day sales history."
+        )
+        coverage_chart = analysis.loc[
+            analysis["days_inventory_remaining"].notna()
+        ]
+        if not coverage_chart.empty:
+            fig_coverage = px.bar(
+                coverage_chart.sort_values(
+                    "days_inventory_remaining",
+                    ascending=True,
+                ),
+                x="days_inventory_remaining",
+                y="product_name",
+                color="classification",
+                orientation="h",
+                title="Estimated Days of Inventory Remaining",
+                labels={
+                    "days_inventory_remaining": "Days of inventory",
+                    "product_name": "Product",
+                },
+            )
+            fig_coverage.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font_color="#CBD5E1",
+            )
+            st.plotly_chart(
+                fig_coverage,
+                use_container_width=True,
+            )
+
+        display_columns = [
+            "product_id",
+            "product_name",
+            "stock_quantity",
+            "average_daily_demand",
+            "demand_source",
+            "days_inventory_remaining",
+            "expected_demand_overstock_horizon",
+            "excess_quantity",
+            "classification",
+            "classification_explanation",
+        ]
+        st.dataframe(
+            analysis[display_columns],
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.download_button(
+            "Download Overstock Analysis CSV",
+            data=analysis.to_csv(index=False).encode("utf-8"),
+            file_name="overstock_intelligence.csv",
+            mime="text/csv",
+        )
+
+
+elif page == "AI Reorder Recommendations":
+
+    st.markdown(
+        '<div class="section-title">AI REORDER RECOMMENDATIONS</div>',
+        unsafe_allow_html=True
+    )
+    st.info(
+        "Recommendations are suggestions only. Review inventory accuracy, "
+        "open purchase orders, supplier, and lead time before manually "
+        "approving an order."
+    )
+    inventory_data, historical_sales = render_intelligence_data_source(
+        "reorder"
+    )
+    safety_buffer_days = st.slider(
+        "Safety stock buffer (days)",
+        min_value=0,
+        max_value=30,
+        value=7,
+        key="reorder_safety_buffer",
+    )
+    reorder_target_days = st.slider(
+        "Order-up-to target beyond lead time (days)",
+        min_value=0,
+        max_value=90,
+        value=30,
+        help=(
+            "Suggested stock target includes forecast lead-time demand, "
+            "the safety buffer, and this configurable coverage target."
+        ),
+        key="reorder_target",
+    )
+    if inventory_data is None:
+        st.info("Provide current inventory data to generate suggestions.")
+    else:
+        try:
+            daily_forecast = load_daily_forecast()
+        except FileNotFoundError:
+            daily_forecast = pd.DataFrame()
+            st.warning(
+                "The daily demand forecast report is missing. Historical "
+                "sales will be used only where supplied."
+            )
+        analysis = build_inventory_analysis(
+            inventory_data,
+            daily_forecast,
+            historical_sales,
+            safety_buffer_days=safety_buffer_days,
+            reorder_target_days=reorder_target_days,
+        )
+        recommendations = get_reorder_recommendations(analysis)
+
+        open_orders_verified = (
+            "pending_order_quantity" in inventory_data.columns
+            and inventory_data["pending_order_quantity"].notna().all()
+        )
+        if not open_orders_verified:
+            st.warning(
+                "Open purchase orders could not be verified for every "
+                "product. Check for outstanding orders before approving "
+                "these suggestions."
+            )
+
+        st.markdown("### REPLENISHMENT SUMMARY")
+        reorder_kpis = st.columns(3)
+        reorder_kpis[0].metric(
+            "Products Requiring Review",
+            len(recommendations),
+        )
+        reorder_kpis[1].metric(
+            "Suggested Units",
+            f"{recommendations['recommended_order_quantity'].sum():,.0f}"
+            if not recommendations.empty
+            else "0",
+        )
+        reorder_kpis[2].metric(
+            "Critical Urgency",
+            int(
+                recommendations["reorder_urgency"].eq("Critical").sum()
+            )
+            if not recommendations.empty
+            else 0,
+        )
+
+        st.caption(
+            "Reorder point = max(recorded reorder level, forecast lead-time "
+            "demand + safety-buffer demand). Order-up-to quantity includes "
+            "lead-time demand, safety buffer, and the selected target days, "
+            "minus current stock and verified pending quantities. Demand is "
+            "the mean of available future forecasts, with a 90-day historical "
+            "sales fallback where forecasts are unavailable."
+        )
+        if recommendations.empty:
+            st.success(
+                "No product currently meets the configured replenishment "
+                "trigger, or demand/lead-time data is unavailable."
+            )
+        else:
+            chart = px.bar(
+                recommendations.sort_values(
+                    "recommended_order_quantity",
+                    ascending=True,
+                ),
+                x="recommended_order_quantity",
+                y="product_name",
+                color="reorder_urgency",
+                orientation="h",
+                title="Suggested Replenishment Quantity",
+                labels={
+                    "recommended_order_quantity": "Suggested units",
+                    "product_name": "Product",
+                },
+            )
+            chart.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font_color="#CBD5E1",
+            )
+            st.plotly_chart(
+                chart,
+                use_container_width=True,
+            )
+
+        recommendation_columns = [
+            "product_id",
+            "product_name",
+            "stock_quantity",
+            "average_daily_demand",
+            "demand_source",
+            "expected_lead_time_demand",
+            "lead_time_days",
+            "reorder_level",
+            "pending_order_quantity",
+            "recommended_order_quantity",
+            "reorder_urgency",
+            "supplier_display",
+            "estimated_arrival_date",
+            "pending_order_check",
+        ]
+        for optional_column in ("supplier_mapping_source",):
+            if optional_column in recommendations.columns:
+                recommendation_columns.append(optional_column)
+        if not recommendations.empty:
+            st.dataframe(
+                recommendations[recommendation_columns],
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.download_button(
+                "Download Reorder Suggestions CSV",
+                data=recommendations.to_csv(index=False).encode("utf-8"),
+                file_name="ai_reorder_recommendations.csv",
+                mime="text/csv",
+            )
+
+
 elif page == "Forecast Performance":
 
     st.markdown(
@@ -1330,6 +2155,9 @@ elif page == "Project Guide":
             "Inventory Monitoring",
             "Supplier Analytics",
             "Forecast Performance",
+            "Inventory Turnover",
+            "Overstock Intelligence",
+            "AI Reorder Recommendations",
             "Project Guide"
         ],
         "What It Does": [
@@ -1339,6 +2167,9 @@ elif page == "Project Guide":
             "Monitors stock and reorder levels",
             "Analyses suppliers and purchase orders",
             "Evaluates machine learning performance",
+            "Calculates cost-based turnover from supplied snapshots",
+            "Classifies stock coverage against forecast demand",
+            "Suggests replenishment quantities for manual review",
             "Explains the complete project"
         ]
     }
@@ -1467,3 +2298,5 @@ st.caption(
     "Note: Historical sales in this demonstration use simulated data. "
     "Forecasts are model estimates, not guaranteed future demand."
 )
+
+
